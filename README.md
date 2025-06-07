@@ -64,3 +64,27 @@ $ forge --help
 $ anvil --help
 $ cast --help
 ```
+
+##### Arb Logic flow
+###### Sell (zeroForOne = true)
+- User sells 1 eth for 2500 usdc, Pool A
+    - Pool A price is now 2450
+
+- Arb sells 1 eth for 2500 usdc, Pool B
+    - Pool B price is now 2480
+
+- Arb buys 1 eth for 2450, Pool A
+    - Pool A price is now 2500
+
+- Profit = 50
+
+
+###### Buy (zerForOne = false)
+- User buys 1 eth for 2500 usdc, Pool A
+    - Pool A price is now 2550
+
+- Arb buys 1 eth for 2500 usdc, Pool B
+    - Pool B price is now 2520
+
+- Arb sells 1 eth for 2550, Pool A
+    - Pool A price is now 2500 again
