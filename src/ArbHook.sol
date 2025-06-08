@@ -169,6 +169,7 @@ contract PINHook is BaseHook {
             
             _executingArb = false; // Reset flag after arbitrage
         }
+        
 
         //-------------------------------------------------------------------
 
@@ -382,6 +383,7 @@ contract PINHook is BaseHook {
 
             return finalProfit;
         }
+        return 0;
     }
 
     function calcArbAmount(
