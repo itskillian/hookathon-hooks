@@ -351,7 +351,37 @@ contract PINHook is BaseHook {
         uint256 gasCostWei = (arbPoolQuote.gasEstimate + hookPoolQuote.gasEstimate) * tx.gasprice;
         uint256 gasCostInProfitToken = getGasCostInProfitToken(gasCostWei);
 
-        return grossArbProfit - gasCostInProfitToken;
+        uint256 netArbProfit = grossArbProfit - gasCostInProfitToken;
+        if (netArbProfit > 0) {
+            // TODO complete arb swap logic
+
+            // set swap params A
+            SwapParams memory swapAParams = SwapParams({
+                zeroForOne: !zeroForOne,
+                amountSpecified: -int256(amount),
+                sqrtPriceLimitX96: 0 // TODO
+            });
+            
+            // swap A
+            BalanceDelta swapDeltaA = poolManager.swap(key, swapAParams, "");
+
+            // swap params B
+            SwapParams memory swapBParams = SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: -int256(zeroForOne ? swapDeltaA.amount0() : swapDeltaA.amount1()),
+                sqrtPriceLimitX96: 0 // TODO
+            });
+
+
+            // swap B
+            BalanceDelta swapDeltaB = poolManager.swap(arbPoolKeysArray[bestQuoteIndex], swapBParams, "");
+
+            uint256 finalProfit = zeroForOne ?
+                uint256(int256(swapDeltaB.amount1()) + int256(amount)) :
+                uint256(int256(swapDeltaB.amount0()) + int256(amount));
+
+            return finalProfit;
+        }
     }
 
     function calcArbAmount(
@@ -361,17 +391,6 @@ contract PINHook is BaseHook {
     ) internal view returns (uint256) {
         // Use the actual AMM math to find exact amount needed
         uint128 liquidity = poolManager.getLiquidity(key.toId());
-        
-        // usdc/eth pool, current price and target price are in usdc terms
-        // e.g. 1 eth costs 2000 usdc, current price is 2000
-        
-        // scenario 1: original swap is zeroForOne = true, buy eth with usdc
-        // this pushes price up so: current > target
-        // first arb trade in Pool A: sell eth for usdc to bring price down to target
-        // call getAmount1Delta to get amount of eth needed to bring price down to target
-        
-
-        // 
 
         // Calculate amount needed to reach target price based on trade direction
         uint256 exactAmount;

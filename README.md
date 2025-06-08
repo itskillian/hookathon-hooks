@@ -88,3 +88,12 @@ $ cast --help
 
 - Arb sells 1 eth for 2550, Pool A
     - Pool A price is now 2500 again
+
+Swap logic flow
+    // usdc/eth pool, current price and target price are in usdc terms
+    // e.g. 1 eth costs 2000 usdc, current price is 2000
+
+    // scenario 1: original swap is zeroForOne = true, buy eth with usdc
+    // this pushes price up so: current > target
+    // first arb trade in Pool A: sell eth for usdc to bring price down to target
+    // call getAmount1Delta to get amount of eth needed to bring price down to target
