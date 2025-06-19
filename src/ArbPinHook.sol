@@ -37,7 +37,7 @@ contract ArbPinHook is BaseHook {
 
     // structs
     struct PoolData {
-        uint256 totalVolume; // tracked by afterSwap in token0 terms
+        uint256 totalVolume0; // tracked by afterSwap in token0 terms
         int256 netVolume; // tracked by afterSwap in token0 terms
         uint32 lastTimeUpdate; // tracked by afterSwap
         uint32 timeDecaySeconds; // config
@@ -168,10 +168,10 @@ contract ArbPinHook is BaseHook {
         console.log("avgILLIQ", data.avgILLIQ);
         console.log("expectedPriceImpact", expectedPriceImpact);
 
-        // Calculate inventory exposure
+        // Calculate inventory exposure 
         uint256 relevantInventoryExposure = calculateInventoryExposure(
             data,
-            params.zeroForOne
+            params.zeroForOne // TODO inventory token - user chooses
         );
         console.log("relevantInventoryExposure", relevantInventoryExposure);
 
@@ -213,9 +213,10 @@ contract ArbPinHook is BaseHook {
 
         // Volume of the last completed trade
         uint256 lastTradeVolume = uint256(abs(delta.amount0()));
+		uint256 token1TradeVolume = uint256(abs(delta.amount1()));
 
         // Update ILLIQ ratio with data from the last completed trade
-        updateILLIQ(data, lastTradePriceImpact, lastTradeVolume);
+        updateILLIQ(data, lastTradePriceImpact, token1TradeVolume);
 
         // Update total volume and net volume after swap
         data.totalVolume += lastTradeVolume;
@@ -233,6 +234,9 @@ contract ArbPinHook is BaseHook {
         );
 
         // ------ ARB LOGIC ------
+        if (msg.sender == address(quoter)) {
+            return (BaseHook.afterSwap.selector, 0);
+        }
 
         if (!_executingArb) {
             _executingArb = true;
@@ -451,6 +455,11 @@ contract ArbPinHook is BaseHook {
         // inventoryExposure is scaled by PRECISION (1e18, represents percentage, multiplied by inventoryMultiplier for amplification)
         // pin is scaled by PRECISION (1e18, represents percentage)
         // FEE_DIVISOR = PIPS_SCALE * PRECISION^2 / 10000 to convert directly to pips (1% = 10000 pips)
+		
+		// TODO
+		// expected IL = expected PI * inventory exposure
+		// expected permanent loss = expected IL * PIN
+
         uint256 feeIncreasePips = (expectedPriceImpact *
             inventoryExposure *
             pin) / FEE_DIVISOR;
@@ -699,5 +708,130 @@ contract ArbPinHook is BaseHook {
             revert InvalidFee();
 
         data.minFee = newMinFee;
-    }
+    }	
 }
+
+// arb logic flows
+	// _afterswap
+		// formula to solve for amount0 and amount1
+			// calc ILLQ poolA using last poolA swap
+			// call ILLQ poolB using last poolB swap
+		// 1st quote poolA
+		// 1st quote poolB
+		// if arb < 0 & prices within 1%
+			// swap
+
+		// formula #2 time
+			// ILLQ from both 1st quotes
+		// 2nd quote poolA
+		// 2nd quote poolB
+		// if arb < 0 & prices within 1%
+			// swap
+
+		// formula #3 time
+			// IllQ from both 2nd quotes
+		// 3rd quote poolA
+		// 3rd quote poolB
+		// if arb < 0 & prices within 1%
+			// swap
+		// else ???
+			// TODO
+
+// --------------------
+// TODOs:
+// allow pool init to decide quote asset for illiq, VPIN + other metrics etc...
+	// or use conversion function
+
+// make formula to solve for amount0 (assume all metrics are in quote asset - token1)
+	// scenario A, BUY order in pool, arb1 pool a == SELL, arb2 pool b == BUY
+
+	// illiq = price impact / vol(amount)
+	// price impact = illiq * amount
+	// new price = price * (1 +/- price impact)
+
+	// price impact = 1 +/- (after price / before price) useless?
+
+	// input token0 (x)
+	// output token1 (y)
+
+	// SELL vol token0 in pool A:
+	// zeroForOne == true
+	// SELL pushes price DOWN:
+	// new_price_a = price_a * (1 - PI_a)
+	// x_in_token1 = x * price_a
+		// e.g. x_in_token1 = 1eth * 2000usdc = 2000usdc
+	// pi_a = illiq_a * x_in_token1
+	// pi_a = illiq_a * x * price_a
+	
+	// new_price_a = price_a * (1 - illiq_a * x * price_a)
+	
+	// y = x * new_price_a
+	// y = x * price_a * (1 - illiq_a * x * price_a) CHECKED
+
+	// BUY order pool B:
+	// zeroForOne == false
+	// BUY pushes price UP
+	// new_price_b = price_b * (1 + PI_b)
+	// pi_b = illiq_b * y
+	// pi_b = illiq_b * x * price_a * (1 - illiq_a * x * price_a)
+	// new_price_b = price_b * (1 + illiq_b * x * price_a * (1 - illiq_a * x * price_a))
+
+	// new_price_a = new_price_b
+	// price_a * (1 - illiq_a * x * price_a) = price_b * (1 + illiq_b * x * price_a * (1 - illiq_a * x * price_a))
+	// (price_b * illiq_a * illiq_b * price_a^2)x^2 - (price_a^2*illiq_a + price_b * illiq_b * price_a) * x + (price_a - price_b) = 0
+
+	// PI_a = illiq_a * (amount1)
+	// amount1 = amount0 * price_a
+	// PI_a = illiq_a * amount0 * price_a
+
+	// new_price_a = price_a * (1 - illiq_a * amount0 * price_a)
+
+	// scenario B, SELL order in pool, arb1 pool a == BUY, arb2 pool b == SELL
+
+	// illiq = price impact / vol(amount)
+	// price impact = illiq * amount
+	// new price = price * (1 +/- price impact)
+
+	// input token0 (x)
+	// output token1 (y)
+
+	// BUY order in pool A:
+	// zeroForOne == false
+	// BUY pushes price up ->
+	// new_price_a = price_a * (1 + pi_a)
+	// pi_a = illiq_a * y
+	// new_price_a = price_a * (1 + illiq_a * y)
+	// x = y / new_price_a
+	// x = y / (price_a * (1 + illiq_a * y))
+
+	// SELL order in Pool B:
+	// zerForOne == true
+	// SELL pushes price down ->
+	// new_price_b = price_b * (1 - pi_b)
+	// pi_b = illiq_b * x * price_b
+	// pi_b = illiq_b * price_b * (y / (price_a * (1 + illiq_a * y)))
+	// new_price_b = price_b * (1 - (illiq_b * price_b * (y / (price_a * (1 + illiq_a * y)))))
+	// new_price_b = price_b - price_b^2 * illiq_b * y / (price_a * (1 + illiq_a * y))
+
+	// price_a * (1 + illiq_a * y) = price_b - price_b^2 * illiq_b * y / (price_a * (1 + illiq_a * y))
+	// price_a + price_a * illiq_a * y = price_b - price_b^2 * illiq_b * y / (price_a * (1 + illiq_a * y))
+	// price_a + price_a * illiq_a * y = price_b - price_b^2 * illiq_b * y / (price_a + price_a * illiq_a * y)
+	// (price_a + price_a * illiq_a * y)^2 = price_b * (price_a + price_a * illiq_a * y) - price_b^2 * illiq_b * y
+	// price_a^2 + 2 * price_a^2 * illiq_a * y + price_a^2 * illiq_a^2 * y^2 = price_a * price_b + price_a * price_b * illiq_a * y - price_b^2 * illiq_b * y
+	// price_a^2 * illiq_a^2 * y^2 + (2 * price_a^2 * illiq_a - price_a * price_b * illiq_a + price_b^2 * illiq_b) * y + (price_a^2 - price_a * price_b) = 0
+	
+	// This is a quadratic equation in terms of y:
+	// A * y^2 + B * y + C = 0
+	// where:
+	// A = price_a^2 * illiq_a^2
+	// B = 2 * price_a^2 * illiq_a - price_a * price_b * illiq_a + price_b^2 * illiq_b
+	// C = price_a^2 - price_a * price_b
+	
+	// Using quadratic formula: y = (-B ± sqrt(B^2 - 4*A*C)) / (2*A)
+	// We take the positive root since y represents a positive amount
+
+	// FINAL FORMULAS
+		// zerForOne == true
+		// (P_B * ILLIQ_A * ILLIQ_B * P_A²)x² - (P_A² * ILLIQ_A + P_B * ILLIQ_B * P_A) * x + (P_A - P_B) = 0
+		// (price_b * illiq_a * illiq_b * price_a^2)x^2 - (price_a^2 * illiq_a + price_b * illiq_b * price_a)x + (price_a - price_b) = 0
+        
