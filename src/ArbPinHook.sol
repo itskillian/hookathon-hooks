@@ -28,29 +28,40 @@ contract ArbPinHook is BaseHook {
 
     uint256 private constant PRECISION = 1e18;
     uint256 private constant PIPS_SCALE = 1e6;
+    uint256 private constant ILLIQ_SCALE = 1e6;
     uint256 private constant FEE_DIVISOR = 1e38; // PIPS_SCALE * PRECISION^2 / 10000 for direct pips calculation
+
+    event PoolConfigured(PoolId indexed poolId, bool useToken1AsQuote, PoolKey arbPoolKey);
 
     error MustUseDynamicFee();
     error Unauthorized();
     error InvalidTimeDecay();
     error InvalidFee();
 
-    // structs
-    struct PoolData {
-        uint256 totalVolume0; // tracked by afterSwap in token0 terms
-        int256 netVolume; // tracked by afterSwap in token0 terms
-        uint32 lastTimeUpdate; // tracked by afterSwap
-        uint32 timeDecaySeconds; // config
-        uint256 decayPerSecond; // PRECISION / timeDecaySeconds
-        uint24 minFee; // minimum fee in pips
-        int8 deltaDecimals; // token0Decimals - token1Decimals
-        uint160 sqrtPriceX96Before; // cached price before swap
-        uint256 avgILLIQ; // running average ILLIQ ratio * 10^6
-        uint256 tradeCount; // number of trades used in ILLIQ average
-        uint256 inventoryToken0; // current inventory of token0
-        uint256 inventoryToken1; // current inventory of token1
-        uint256 tvl; // total value locked
+    struct Inventory {
+        uint256 token0;
+        uint256 token1;
     }
+    
+    struct PoolData {
+        // config
+        uint24 minFee; // in pips
+        int8 deltaDecimals; // = token0Decimals - token1Decimals
+        bool isConfigured;
+        bool useToken1AsQuote; // true for token1
+        address poolCreator;
+        // state
+        uint256 lastTimeUpdate;
+        uint256 totalVolume; // token1
+        int256 netVolume; // token1
+        uint160 sqrtPriceX96Before;
+        uint160 sqrtPriceX96After;
+        uint256 avgILLIQ; // token1
+        uint256 tradeCount; // number of trades used in ILLIQ average
+        Inventory inventory;
+        uint256 tvl; // token 1
+    }
+
     struct Quote {
         uint256 amountOut;
         uint256 gasEstimate;
@@ -60,10 +71,10 @@ contract ArbPinHook is BaseHook {
     IV4Quoter public immutable quoter;
     address public owner;
     bool private _executingArb;
-    
-    // mappings
-    mapping(PoolId => PoolData) public poolData; // store pool data
-    mapping(PoolId => PoolKey[]) public arbPoolKeys; // store pool keys for arb
+
+    mapping(PoolId => PoolData) public poolData; // main poolId -> pool data
+    mapping(PoolId => PoolKey) public arbPoolKey; // main poolId -> arb pool key
+    mapping(PoolId => address) public poolCreator; // main poolId -> pool creator
 
     // constructor
     constructor(IPoolManager _poolManager, IV4Quoter _quoter) BaseHook(_poolManager) {
@@ -80,20 +91,26 @@ contract ArbPinHook is BaseHook {
         _;
     }
 
+    modifier onlyCreator(PoolId poolId) {
+        if (poolCreator[poolId] != msg.sender) revert Unauthorized();
+        _;
+    }
+
     /*
     ------ CORE HOOK FUNCTIONS ------ 
     */
 
+    // Check if the pool supports dynamic fees
     function _beforeInitialize(
         address,
         PoolKey calldata key,
         uint160
     ) internal pure override returns (bytes4) {
-        // Check if the pool supports dynamic fees
         if (!key.fee.isDynamicFee()) revert MustUseDynamicFee();
         return BaseHook.beforeInitialize.selector;
     }
 
+    // Initialize pool data
     function _afterInitialize(
         address,
         PoolKey calldata key,
@@ -103,38 +120,15 @@ contract ArbPinHook is BaseHook {
         PoolId poolId = key.toId();
         PoolData storage data = poolData[poolId];
 
-        // Initialize pool data with non-zero default values
-        data.timeDecaySeconds = 604800; // 7 days
-        data.decayPerSecond = PRECISION / data.timeDecaySeconds; // scaled by PRECISION
-        data.totalVolume = 1e18; // in token0 terms - start with small positive value to avoid division by zero
-        data.netVolume = 1e16; // in token0 terms - start with small positive value to avoid division by zero
-        data.lastTimeUpdate = uint32(block.timestamp);
         data.minFee = 500; // 0.05% in pips
-        // Cache token decimals to avoid external calls on every swap
-        data.deltaDecimals =
-            int8(
-                SafeCurrencyMetadata.currencyDecimals(
-                    Currency.unwrap(key.currency0)
-                )
-            ) -
-            int8(
-                SafeCurrencyMetadata.currencyDecimals(
-                    Currency.unwrap(key.currency1)
-                )
-            );
-
-        console.log("---- AFTER INITIALIZE LOGIC ----");
-        console.log("timeDecaySeconds", data.timeDecaySeconds);
-        console.log("decayPerSecond", data.decayPerSecond);
-        console.log("totalVolume", data.totalVolume);
-        console.log("netVolume", data.netVolume);
-        console.log("lastTimeUpdate", data.lastTimeUpdate);
-        console.log("minFee", data.minFee);
-        console.log("deltaDecimals", data.deltaDecimals);
+        data.deltaDecimals = int8(SafeCurrencyMetadata.currencyDecimals(Currency.unwrap(key.currency0)))
+            - int8(SafeCurrencyMetadata.currencyDecimals(Currency.unwrap(key.currency1)));
+        data.poolCreator = msg.sender;
 
         return BaseHook.afterInitialize.selector;
     }
 
+    // calc PIN, calc inventory exposure, calc dynamic fee for swap
     function _beforeSwap(
         address,
         PoolKey calldata key,
@@ -143,46 +137,32 @@ contract ArbPinHook is BaseHook {
     ) internal override returns (bytes4, BeforeSwapDelta, uint24) {
         PoolId poolId = key.toId();
         PoolData storage data = poolData[poolId];
+        require(data.isConfigured, "Pool not configured");
 
         // get price before swap
         (data.sqrtPriceX96Before, , , ) = poolManager.getSlot0(poolId);
 
-        console.log("---- BEFORE SWAP LOGIC ----");
+        // return early if pool has no swaps yet
+        if (data.totalVolume == 0 || data.tradeCount == 0) {
+            console.log("First trade detected - using default fee");
+            return (
+                BaseHook.beforeSwap.selector,
+                BeforeSwapDeltaLibrary.ZERO_DELTA,
+                data.minFee | LPFeeLibrary.OVERRIDE_FEE_FLAG
+            );
+        }
+        
+        uint256 nextTradeVolToken1 = getNextTradeVolumeToken1(params, data.sqrtPriceX96Before, data.deltaDecimals);
 
-        // Apply time decay to volumes
-        applyTimeDecay(data);
+        int256 pin = calculatePIN(data.totalVolume, data.netVolume, params.zeroForOne, nextTradeVolToken1);
 
-        // Calculate next trade volume in token0 terms (only once)
-        uint256 nextTradeVolToken0 = getNextTradeVolume(params, data);
+        uint256 expectedPriceImpact = estimatePriceImpactBeforeSwap(data, nextTradeVolToken1);
 
-        // Calculate PIN
-        int256 pin = calculatePIN(data, params, nextTradeVolToken0);
-        console.log("pin before swap", pin);
+        uint256 relevantInventoryExposure = calculateInventoryExposure(data, params.zeroForOne);
 
-        // Calculate expected price impact (now includes trade volume calculation)
-        uint256 expectedPriceImpact = calculateExpectedPriceImpact(
-            data,
-            nextTradeVolToken0
-        );
-        console.log("nextTradeVolToken0", nextTradeVolToken0);
-        console.log("avgILLIQ", data.avgILLIQ);
-        console.log("expectedPriceImpact", expectedPriceImpact);
-
-        // Calculate inventory exposure 
-        uint256 relevantInventoryExposure = calculateInventoryExposure(
-            data,
-            params.zeroForOne // TODO inventory token - user chooses
-        );
-        console.log("relevantInventoryExposure", relevantInventoryExposure);
 
         // Calculate fee based on PIN, expected price impact, and inventory exposure
-        uint24 fee = calculateFee(
-            abs(pin), // current implementation is not direction sensitive, but we could add direction sensitivity wished. For exampel apply inventory exposure protection only if price moves against us
-            data.minFee,
-            expectedPriceImpact,
-            relevantInventoryExposure
-        );
-        console.log("fee", fee);
+        uint24 fee = calculateFee(abs(pin), data.minFee, expectedPriceImpact, relevantInventoryExposure);
 
         return (
             BaseHook.beforeSwap.selector,
@@ -199,41 +179,29 @@ contract ArbPinHook is BaseHook {
         bytes calldata
     ) internal override returns (bytes4, int128) {
         PoolId poolId = key.toId();
-        require(arbPoolKeys[poolId].length > 0, "No arb pools");
-        
         PoolData storage data = poolData[poolId];
+        require(data.isConfigured, "Pool not configured");
 
-        console.log("---- AFTER SWAP LOGIC ----");
+        // ------ POOL DATA UPDATE ------
 
-        // Calculate price impact of the last completed trade
-        uint256 lastTradePriceImpact = calculatePriceImpactAfterSwap(
-            data,
-            poolId
-        );
+        // TODOfunction to update core pool data
+        (data.sqrtPriceX96After, , , ) = poolManager.getSlot0(poolId);
+		uint256 lastTradeVolume1 = uint256(abs(delta.amount1()));
 
-        // Volume of the last completed trade
-        uint256 lastTradeVolume = uint256(abs(delta.amount0()));
-		uint256 token1TradeVolume = uint256(abs(delta.amount1()));
+        uint256 lastTradePriceImpact = calculatePriceImpactAfterSwap(data.sqrtPriceX96Before, data.sqrtPriceX96After);
 
-        // Update ILLIQ ratio with data from the last completed trade
-        updateILLIQ(data, lastTradePriceImpact, token1TradeVolume);
+        if (lastTradeVolume1 > 0) {
+            updateILLIQ(data, lastTradePriceImpact, lastTradeVolume1);   
+            
+            data.totalVolume += lastTradeVolume1;
+            data.netVolume -= int256(delta.amount1());
 
-        // Update total volume and net volume after swap
-        data.totalVolume += lastTradeVolume;
-        // Add to net volume if swapper is buying token0, subtract if selling token0
-        data.netVolume += int256(delta.amount0());
-
-        // Update inventory based on swap deltas
-        // delta.amount0() is positive when pool receives token0, negative when pool gives token0
-        // delta.amount1() is positive when pool receives token1, negative when pool gives token1
-        data.inventoryToken0 = uint256(
-            int256(data.inventoryToken0) + delta.amount0()
-        );
-        data.inventoryToken1 = uint256(
-            int256(data.inventoryToken1) + delta.amount1()
-        );
+            data.inventory.token0 = uint256(int256(data.inventory.token0) - delta.amount0());
+            data.inventory.token1 = uint256(int256(data.inventory.token1) - delta.amount1());
+        }
 
         // ------ ARB LOGIC ------
+        // BIG TODO
         if (msg.sender == address(quoter)) {
             return (BaseHook.afterSwap.selector, 0);
         }
@@ -241,19 +209,16 @@ contract ArbPinHook is BaseHook {
         if (!_executingArb) {
             _executingArb = true;
             
-            (uint160 afterSwapPriceX96, , , ) = poolManager.getSlot0(poolId);
-
-            uint256 arbAmount = calcArbAmount(key, afterSwapPriceX96, data.sqrtPriceX96Before);
+            uint256 arbAmount = calcArbAmount(key, data.sqrtPriceX96After, data.sqrtPriceX96Before);
             
-            // uint256 arbProfit = 
             detectAndExecuteArb(
                 key,
-                arbPoolKeys[poolId], 
+                arbPoolKey[poolId], 
                 arbAmount,
                 swapParams.zeroForOne
             );
             
-            _executingArb = false; // Reset flag after arbitrage
+            _executingArb = false; // Reset flag after arb
         }
 
         return (BaseHook.afterSwap.selector, 0);
@@ -270,10 +235,8 @@ contract ArbPinHook is BaseHook {
         PoolId poolId = key.toId();
         PoolData storage data = poolData[poolId];
 
-        // Update inventory when liquidity is added
-        // delta.amount0() and delta.amount1() are positive when tokens are added to the pool
-        data.inventoryToken0 += uint256(abs(delta.amount0()));
-        data.inventoryToken1 += uint256(abs(delta.amount1()));
+        data.inventory.token0 = data.inventory.token0 + abs(delta.amount0());
+        data.inventory.token1 = data.inventory.token1 + abs(delta.amount1());
 
         return (BaseHook.afterAddLiquidity.selector, BalanceDelta.wrap(0));
     }
@@ -289,14 +252,8 @@ contract ArbPinHook is BaseHook {
         PoolId poolId = key.toId();
         PoolData storage data = poolData[poolId];
 
-        // Update inventory when liquidity is removed
-        // delta.amount0() and delta.amount1() are negative when tokens are removed from the pool
-        data.inventoryToken0 = uint256(
-            int256(data.inventoryToken0) + delta.amount0()
-        );
-        data.inventoryToken1 = uint256(
-            int256(data.inventoryToken1) + delta.amount1()
-        );
+        data.inventory.token0 = data.inventory.token0 - abs(delta.amount0());
+        data.inventory.token1 = data.inventory.token1 - abs(delta.amount1());
 
         return (BaseHook.afterRemoveLiquidity.selector, BalanceDelta.wrap(0));
     }
@@ -304,142 +261,106 @@ contract ArbPinHook is BaseHook {
     /*
     ------ HELPER FUNCTIONS ------ 
     */
-
-    function applyTimeDecay(PoolData storage data) internal {
-        // Calculate time decay
-        uint32 currentTime = uint32(block.timestamp);
-        uint32 secondsPassed = currentTime - data.lastTimeUpdate;
-        // Cap decay to slightly less than 100% to ensure volumes never reach zero
-        uint256 timeDecay = secondsPassed > data.timeDecaySeconds
-            ? PRECISION - 1 // Max 99.999...% decay, never 100%
-            : secondsPassed * data.decayPerSecond;
-
-        // reduce volume pre swap by time decay
-        data.totalVolume =
-            (data.totalVolume * (PRECISION - timeDecay)) /
-            PRECISION;
-        data.netVolume =
-            (data.netVolume * int256(PRECISION - timeDecay)) /
-            int256(PRECISION);
-        data.lastTimeUpdate = currentTime;
-
-        console.log("---- Results of time decay function ----");
-        console.log("currentTime", currentTime);
-        console.log("lastTimeUpdate", data.lastTimeUpdate);
-        console.log("secondsPassed", secondsPassed);
-        console.log("timeDecay", timeDecay);
-        console.log("totalVolume", data.totalVolume);
-        console.log("netVolume", data.netVolume);
-    }
-
-    function getNextTradeVolume(
+    
+    /**
+     * @dev Get or estimate the next trade volume of token1
+     * @param params swap params sent by user
+     * @param sqrtPriceX96Before price before swap
+     * @param deltaDecimals difference in decimals between token0 and token1
+     * @return next trade volume of token1
+     */
+    function getNextTradeVolumeToken1(
         SwapParams calldata params,
-        PoolData storage data
-    ) internal view returns (uint256) {
-        // Check if amountSpecified is in token0 terms, otherwise convert
-        bool isToken0 = params.zeroForOne == (params.amountSpecified < 0);
+        uint160 sqrtPriceX96Before,
+        int8 deltaDecimals
+    ) internal pure returns (uint256) {
+        if (sqrtPriceX96Before == 0) return 0;
+        
+        uint256 absoluteAmount = abs(params.amountSpecified);
 
-        if (isToken0) {
-            return abs(params.amountSpecified);
+        if (params.zeroForOne) {
+            if (params.amountSpecified > 0) {
+                // Exact input token0 - convert to token1
+                return convertToken0ToToken1(absoluteAmount, sqrtPriceX96Before, deltaDecimals);
+            } else {
+                return absoluteAmount;
+            }
+        } else {
+            if (params.amountSpecified > 0) {
+                return absoluteAmount;
+            } else {
+                // Exact output of token0 - convert to token1
+                return convertToken0ToToken1(absoluteAmount, sqrtPriceX96Before, deltaDecimals);
+            }
         }
-
-        // Convert token1 amount to token0 terms using cached price
-        uint256 amount = abs(params.amountSpecified);
-
-        // Use cached price from data struct instead of fetching again
-        uint256 scaledAmount = data.deltaDecimals >= 0
-            ? amount * (10 ** uint8(data.deltaDecimals))
-            : amount / (10 ** uint8(-data.deltaDecimals));
-        uint256 intermediate = (scaledAmount << 96) / data.sqrtPriceX96Before;
-        uint256 token0Amount = (intermediate << 96) / data.sqrtPriceX96Before;
-
-        return token0Amount;
     }
 
     function calculatePIN(
-        PoolData storage data,
-        SwapParams calldata params,
-        uint256 nextTradeVolToken0
-    ) internal view returns (int256) {
-        // calculate total volume including next trade
-        uint256 totalVolumeInterim = data.totalVolume + nextTradeVolToken0;
+        uint256 totalVolume,
+        int256 netVolume,
+        bool zeroForOne,
+        uint256 nextTradeVolToken1
+    ) internal pure returns (int256 pin) {
+        uint256 tempTotalVolume = totalVolume + nextTradeVolToken1;
 
-        // if swapper is buying token0 add to net volume, if selling token0 subtract from net volume
-        int256 netVolumeInterim = data.netVolume +
-            (
-                params.zeroForOne
-                    ? -int256(nextTradeVolToken0)
-                    : int256(nextTradeVolToken0)
-            );
+        
+        if (tempTotalVolume > 0) {
+            int256 tempNetVolume = netVolume +
+                (
+                    zeroForOne
+                        ? -int256(nextTradeVolToken1)
+                        : int256(nextTradeVolToken1)
+                );
 
-        console.log("---- Results of PIN calculation function----");
-        console.log("params.zeroForOne", params.zeroForOne);
-        console.log("params.amountSpecified", params.amountSpecified);
-        console.log("nextTradeVolToken0", nextTradeVolToken0);
-        console.log("totalVolumeInterim", totalVolumeInterim);
-        console.log("netVolumeInterim", netVolumeInterim);
-
-        return
-            (netVolumeInterim * int256(PRECISION)) / int256(totalVolumeInterim);
-    }
-
-    function calculateExpectedPriceImpact(
-        PoolData storage data,
-        uint256 nextTradeVolToken0
-    ) internal view returns (uint256) {
-        // If no historical data available, return a default small value
-        if (data.avgILLIQ == 0 || nextTradeVolToken0 == 0) {
-            return 1000; // 0.1% default price impact in pips scale (1000 / 1e6 = 0.001)
+            pin = tempNetVolume * int256(PRECISION) / int256(tempTotalVolume);
+        } else {
+            // NOTE #3
+            pin = 0;
         }
-
-        // Expected price impact = avgILLIQ * volume / 1e6 (since ILLIQ is scaled by 1e6)
-        // ILLIQ formula: (priceImpact_in_pips_scale * 1e6) / volume
-        // So: priceImpact_in_pips_scale = (ILLIQ * volume) / 1e6
-        return (data.avgILLIQ * nextTradeVolToken0) / (1e6 * PRECISION);
     }
 
+    /**
+     * @dev Estimate the expected price impact of the next trade before swap
+     * @param data pool data storage pointer
+     * @param nextTradeVolToken1 next trade volume in token1 terms
+     * @return expectedPriceImpact expected price impact of the next trade scaled by PIPS_SCALE (1e6)
+     */
+    function estimatePriceImpactBeforeSwap(
+        PoolData storage data,
+        uint256 nextTradeVolToken1
+    ) internal view returns (uint256 expectedPriceImpact) {
+        // TODO is this min fee alright?
+        if (data.avgILLIQ == 0 || nextTradeVolToken1 == 0) {
+            return data.minFee;
+        }
+        
+        expectedPriceImpact = (data.avgILLIQ * nextTradeVolToken1) / (1e6 * PRECISION);
+    }
+
+    /**
+     * @dev Calculate inventory exposure of both tokens in token1 terms, and update data.tvl
+     */
     function calculateInventoryExposure(
         PoolData storage data,
         bool zeroForOne
     ) internal returns (uint256) {
-        // Adjust token0 inventory for decimal differences before price conversion
+        uint256 inventoryToken0InToken1Terms = convertToken0ToToken1(data.inventory.token0, data.sqrtPriceX96Before, data.deltaDecimals);
+        uint256 inventoryToken1InToken1Terms = scaleDecimalsUp(data.inventory.token1, data.deltaDecimals, true);
 
-        uint256 adjustedToken0Inventory = data.deltaDecimals >= 0
-            ? data.inventoryToken0 / (10 ** uint8(data.deltaDecimals))
-            : data.inventoryToken0 * (10 ** uint8(-data.deltaDecimals));
+        data.tvl = inventoryToken0InToken1Terms + inventoryToken1InToken1Terms;
 
-        // Convert adjusted token0 inventory to token1 terms: token0 * (sqrtPriceX96/2^96)^2 = token0 * sqrtPriceX96^2 / 2^192
-        uint256 inventoryToken0InToken1Terms = FullMath.mulDiv(
-            FullMath.mulDiv(
-                adjustedToken0Inventory,
-                data.sqrtPriceX96Before,
-                FixedPoint96.Q96
-            ),
-            data.sqrtPriceX96Before,
-            FixedPoint96.Q96
-        );
-        data.tvl = inventoryToken0InToken1Terms + data.inventoryToken1;
+        if (data.tvl > 0) {
+            // Calculate only the exposure we need
+            if (zeroForOne) {
+                // pool receives token0, therefore return inverse of token0 exposure
+                return (inventoryToken0InToken1Terms * PRECISION) / data.tvl;
+            } else {
+                // Return token1 exposure (LP will receive more token1)  
+                return (inventoryToken1InToken1Terms * PRECISION) / data.tvl;
+            }
+        }
 
-        uint256 inventoryExposure0 = data.tvl > 0
-            ? ((data.tvl - data.inventoryToken1) * PRECISION) / data.tvl
-            : 0;
-        uint256 inventoryExposure1 = PRECISION - inventoryExposure0;
-
-        console.log("---- Results of inventory exposure calculation ----");
-        console.log("data.tvl", data.tvl);
-        console.log("data.inventoryToken1", data.inventoryToken1);
-        console.log("data.inventoryToken0", data.inventoryToken0);
-        console.log("data.sqrtPriceX96Before", data.sqrtPriceX96Before);
-        console.log(
-            "inventoryToken0InToken1Terms",
-            inventoryToken0InToken1Terms
-        );
-        console.log("inventoryExposure0", inventoryExposure0);
-        console.log("inventoryExposure1", inventoryExposure1);
-        console.log("zeroForOne", zeroForOne);
-
-        // Select appropriate inventory exposure based on trade direction
-        return zeroForOne ? inventoryExposure1 : inventoryExposure0;
+        return 0;
     }
 
     function calculateFee(
@@ -456,7 +377,6 @@ contract ArbPinHook is BaseHook {
         // pin is scaled by PRECISION (1e18, represents percentage)
         // FEE_DIVISOR = PIPS_SCALE * PRECISION^2 / 10000 to convert directly to pips (1% = 10000 pips)
 		
-		// TODO
 		// expected IL = expected PI * inventory exposure
 		// expected permanent loss = expected IL * PIN
 
@@ -475,74 +395,119 @@ contract ArbPinHook is BaseHook {
     }
 
     function calculatePriceImpactAfterSwap(
-        PoolData storage data,
-        PoolId poolId
-    ) internal view returns (uint256) {
-        // Get price after swap
-        (uint160 sqrtPriceX96After, , , ) = poolManager.getSlot0(poolId);
+        uint160 sqrtPriceX96Before,
+        uint160 sqrtPriceX96After
+    ) internal pure returns (uint256 priceImpactPips) {
+        
+        // technically this should never be 0
+        if (sqrtPriceX96Before == 0) return 0;
 
-        if (data.sqrtPriceX96Before == 0) return 0;
-
-        uint256 priceChange = data.sqrtPriceX96Before > sqrtPriceX96After
-            ? data.sqrtPriceX96Before - sqrtPriceX96After
-            : sqrtPriceX96After - data.sqrtPriceX96Before;
+        uint256 priceChange = sqrtPriceX96Before < sqrtPriceX96After
+            ? sqrtPriceX96After - sqrtPriceX96Before
+            : sqrtPriceX96Before - sqrtPriceX96After;
 
         // Return price impact as a percentage scaled by PIPS_SCALE (1e6)
-        return (priceChange * PIPS_SCALE) / data.sqrtPriceX96Before;
+        priceImpactPips = (priceChange * PIPS_SCALE) / sqrtPriceX96Before;
     }
 
+    /**
+     * @dev Updates the running average Illiquidity ratio based on the last trade
+     * @param data pool data storage pointer
+     * @param lastTradePriceImpact price impact of the last trade scaled by PIPS_SCALE
+     * @param lastTradeVolume volume of the last trade in token1 terms
+     */
     function updateILLIQ(
         PoolData storage data,
         uint256 lastTradePriceImpact,
         uint256 lastTradeVolume
     ) internal {
-        // Calculate ILLIQ ratio for the last completed trade: (priceImpact / volume) * 10^6
-        // TODO!!! IF 10^6 is sufficient precision, because highly liquid pools will have below 1 ILLIQ scores, so we may need to scale by 10^7
+        // TODO #1
         if (lastTradeVolume > 0) {
-            uint256 currentILLIQ = (lastTradePriceImpact * 1e6) /
+            uint256 currentILLIQ = (lastTradePriceImpact * ILLIQ_SCALE) /
                 lastTradeVolume;
 
-            // Update running average with equal weights
             if (data.tradeCount == 0) {
                 data.avgILLIQ = currentILLIQ;
             } else {
-                data.avgILLIQ =
-                    (data.avgILLIQ * data.tradeCount + currentILLIQ) /
-                    (data.tradeCount + 1);
+                data.avgILLIQ = (data.avgILLIQ * data.tradeCount + currentILLIQ) / (data.tradeCount + 1);
             }
             data.tradeCount += 1;
+        } else {
+            return;
         }
     }
 
-    // INTERNAL HELPER FUNCTIONS
+    /*
+    ------ INTERNAL HELPER FUNCTIONS ------
+    */
 
     function abs(int256 x) internal pure returns (uint256) {
         return uint256(x < 0 ? -x : x);
+    }
+
+    function normalizeInventoryDecimals(PoolData storage data) internal view returns (Inventory memory) {
+        uint8 scalingFactor = uint8(abs(data.deltaDecimals));
+
+        if (data.deltaDecimals < 0) { // token0: 6 - token1: 18 = -12, therefore token0 must be scaled up
+            return Inventory({
+                token0: data.inventory.token0 * (10 ** scalingFactor),
+                token1: data.inventory.token1
+            });
+        } else if (data.deltaDecimals > 0) { // token0: 18 - token1: 6 = 12, therefore token1 must be scaled up
+            return Inventory({
+                token0: data.inventory.token0,
+                token1: data.inventory.token1 * (10 ** scalingFactor)
+            });
+        } else {
+            return Inventory({
+                token0: data.inventory.token0,
+                token1: data.inventory.token1
+            });
+        }
+    }
+
+    function convertToken0ToToken1(uint256 token0Amount, uint160 sqrtPriceX96, int8 deltaDecimals) internal pure returns (uint256) {
+        require(sqrtPriceX96 > 0, "sqrtPriceX96 must be greater than 0");
+
+        uint256 normalizedToken0Amount = scaleDecimalsUp(token0Amount, deltaDecimals, false);
+        
+        return FullMath.mulDiv(
+            FullMath.mulDiv(
+                normalizedToken0Amount, 
+                sqrtPriceX96, 
+                FixedPoint96.Q96
+            ),
+            sqrtPriceX96, 
+            FixedPoint96.Q96
+        );
+    }
+
+    /**
+     * @dev Scale decimals up to the highest precision between token0 and token1
+     * @param amount amount of the token
+     * @param deltaDecimals difference in decimals between token0 and token1
+     * @param isToken1 true if token1 is the base token, false if token0 is the base token
+     * @return normalized amount
+     */
+    function scaleDecimalsUp(uint256 amount, int8 deltaDecimals, bool isToken1) internal pure returns (uint256) {
+        if (deltaDecimals == 0) return amount;
+        
+        uint8 scalingFactor = uint8(abs(deltaDecimals));
+
+        if (deltaDecimals < 0) {
+            return isToken1 ? amount : amount * (10 ** scalingFactor);
+        } else if (deltaDecimals > 0) {
+            return isToken1 ? amount * (10 ** scalingFactor) : amount;
+        }
     }
 
     /*
     ------ ARB HELPER FUNCTIONS ------ 
     */
 
-   function addArbPool(PoolKey calldata key, PoolId poolId, PoolKey calldata arbPoolKey) external onlyOwner {
-        require(key.currency0 == arbPoolKey.currency0 && key.currency1 == arbPoolKey.currency1, "Arb pool must have same currency pair as the main pool");
-        require(arbPoolKeys[poolId].length < 3, "Max 3 arb pools");
-        
-        arbPoolKeys[poolId].push(arbPoolKey);
-    }
-
-    function removeArbPool(PoolId poolId, uint8 index) external onlyOwner {
-        require(arbPoolKeys[poolId].length > 1, "Min 1 arb pool");
-        require(index < arbPoolKeys[poolId].length, "Index out of bounds");
-        
-        PoolKey[] storage poolKeys = arbPoolKeys[poolId];
-        poolKeys[index] = poolKeys[poolKeys.length - 1];
-        poolKeys.pop();
-    }
-
     function detectAndExecuteArb(
         PoolKey memory key,
-        PoolKey[] memory arbPoolKeysArray,
+        PoolKey memory arbKey,
         uint256 amount,
         bool zeroForOne
     ) internal returns (uint256) {
@@ -563,32 +528,21 @@ contract ArbPinHook is BaseHook {
             gasEstimate: gasEstimate
         });
 
-        // find best quote from arb pools (Pools B, C, D...)
-        uint8 bestQuoteIndex = 0;
-        for (uint8 i = 0; i < arbPoolKeysArray.length; i++) {
-            IV4Quoter.QuoteExactSingleParams memory arbParams = IV4Quoter.QuoteExactSingleParams({
-                poolKey: arbPoolKeysArray[i],
-                zeroForOne: zeroForOne,
-                exactAmount: uint128(hookPoolQuote.amountOut),
-                hookData: ""
-            });
-            (uint256 arbAmountOut, uint256 arbGasEstimate) = quoter.quoteExactInputSingle(arbParams);
-
-            if (arbAmountOut > arbPoolQuote.amountOut) {
-                bestQuoteIndex = i;
-                arbPoolQuote = Quote({
-                    amountOut: arbAmountOut,
-                    gasEstimate: arbGasEstimate
-                });
-            }
-        }
+        // quote arb pool (Pool B)
+        IV4Quoter.QuoteExactSingleParams memory arbParams = IV4Quoter.QuoteExactSingleParams({
+            poolKey: arbKey,
+            zeroForOne: zeroForOne,
+            exactAmount: uint128(hookPoolQuote.amountOut),
+            hookData: ""
+        });
+        (uint256 arbAmountOut, uint256 arbGasEstimate) = quoter.quoteExactInputSingle(arbParams);
 
         // profit is calculated in token1 terms for zeroForOne = true
         // profit is calculated in token0 terms for zeroForOne = false
         // quote A input - quote B output = arb profit
         uint256 grossArbProfit = arbPoolQuote.amountOut - amount;
         uint256 gasCostWei = (arbPoolQuote.gasEstimate + hookPoolQuote.gasEstimate) * tx.gasprice;
-        uint256 gasCostInProfitToken = getGasCostInProfitToken(gasCostWei);
+        uint256 gasCostInProfitToken = getGasCostInQuoteToken(gasCostWei);
 
         uint256 netArbProfit = grossArbProfit - gasCostInProfitToken;
         if (netArbProfit > 0) {
@@ -613,7 +567,7 @@ contract ArbPinHook is BaseHook {
 
 
             // swap B
-            BalanceDelta swapDeltaB = poolManager.swap(arbPoolKeysArray[bestQuoteIndex], swapBParams, "");
+            BalanceDelta swapDeltaB = poolManager.swap(arbKey, swapBParams, "");
 
             uint256 finalProfit = zeroForOne ?
                 uint256(int256(swapDeltaB.amount1()) + int256(amount)) :
@@ -652,11 +606,14 @@ contract ArbPinHook is BaseHook {
         return (exactAmount * 90) / 100;
     }
 
-    function getGasCostInProfitToken(uint256) public pure returns (uint256) {
+    function getGasCostInQuoteToken(uint256) public pure returns (uint256) {
         return 0; // TODO
     }
 
-    // HOOK CONFIGURATION
+    /*
+    ------ HOOK CONFIGURATION ------
+    */
+
     function getHookPermissions()
         public
         pure
@@ -682,23 +639,45 @@ contract ArbPinHook is BaseHook {
             });
     }
 
-    // HOOK MANAGEMENT FUNCTIONS
+    /*
+    ------ HOOK MANAGEMENT FUNCTIONS ------
+    */
 
-    function transferOwnership(address newOwner) external onlyOwner {
+   /**
+     * @dev Configures the pool's quote asset and arb pool
+     * @param poolId main pool id
+     * @param useToken1AsQuote Whether to use token1 as the quote asset
+     * @param key main pool key
+     * @param arbKey arb pool key
+     */
+    function configurePool(
+        PoolId poolId, 
+        bool useToken1AsQuote,
+        PoolKey calldata key,
+        PoolKey calldata arbKey
+    ) external onlyCreator(poolId){
+        PoolData storage data = poolData[poolId];
+        require(!data.isConfigured, "Pool already configured");
+        require(key.currency0 == arbKey.currency0 && key.currency1 == arbKey.currency1, "Arb pool must have same currency pair as the main pool");
+    
+        // set quote asset
+        data.useToken1AsQuote = useToken1AsQuote;
+
+        // set arb pool
+        arbPoolKey[poolId] = arbKey;
+
+        // set PIN bucket size
+        data.isConfigured = true;
+        emit PoolConfigured(poolId, useToken1AsQuote, arbKey);
+    }
+
+    function transferOwner(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert Unauthorized();
         owner = newOwner;
     }
 
-    // Allows owner to update sensitivity of pin metric
-    function updateTimeDecaySeconds(
-        PoolId poolId,
-        uint32 newTimeDecaySeconds
-    ) external onlyOwner {
-        if (newTimeDecaySeconds == 0) revert InvalidTimeDecay();
-
-        PoolData storage data = poolData[poolId];
-        data.timeDecaySeconds = newTimeDecaySeconds;
-        data.decayPerSecond = PRECISION / newTimeDecaySeconds;
+    function transferPoolOwner(PoolId poolId, address newOwner) external onlyCreator(poolId) {
+        poolCreator[poolId] = newOwner;
     }
 
     // Allows owner to update min fee
@@ -708,130 +687,5 @@ contract ArbPinHook is BaseHook {
             revert InvalidFee();
 
         data.minFee = newMinFee;
-    }	
+    }
 }
-
-// arb logic flows
-	// _afterswap
-		// formula to solve for amount0 and amount1
-			// calc ILLQ poolA using last poolA swap
-			// call ILLQ poolB using last poolB swap
-		// 1st quote poolA
-		// 1st quote poolB
-		// if arb < 0 & prices within 1%
-			// swap
-
-		// formula #2 time
-			// ILLQ from both 1st quotes
-		// 2nd quote poolA
-		// 2nd quote poolB
-		// if arb < 0 & prices within 1%
-			// swap
-
-		// formula #3 time
-			// IllQ from both 2nd quotes
-		// 3rd quote poolA
-		// 3rd quote poolB
-		// if arb < 0 & prices within 1%
-			// swap
-		// else ???
-			// TODO
-
-// --------------------
-// TODOs:
-// allow pool init to decide quote asset for illiq, VPIN + other metrics etc...
-	// or use conversion function
-
-// make formula to solve for amount0 (assume all metrics are in quote asset - token1)
-	// scenario A, BUY order in pool, arb1 pool a == SELL, arb2 pool b == BUY
-
-	// illiq = price impact / vol(amount)
-	// price impact = illiq * amount
-	// new price = price * (1 +/- price impact)
-
-	// price impact = 1 +/- (after price / before price) useless?
-
-	// input token0 (x)
-	// output token1 (y)
-
-	// SELL vol token0 in pool A:
-	// zeroForOne == true
-	// SELL pushes price DOWN:
-	// new_price_a = price_a * (1 - PI_a)
-	// x_in_token1 = x * price_a
-		// e.g. x_in_token1 = 1eth * 2000usdc = 2000usdc
-	// pi_a = illiq_a * x_in_token1
-	// pi_a = illiq_a * x * price_a
-	
-	// new_price_a = price_a * (1 - illiq_a * x * price_a)
-	
-	// y = x * new_price_a
-	// y = x * price_a * (1 - illiq_a * x * price_a) CHECKED
-
-	// BUY order pool B:
-	// zeroForOne == false
-	// BUY pushes price UP
-	// new_price_b = price_b * (1 + PI_b)
-	// pi_b = illiq_b * y
-	// pi_b = illiq_b * x * price_a * (1 - illiq_a * x * price_a)
-	// new_price_b = price_b * (1 + illiq_b * x * price_a * (1 - illiq_a * x * price_a))
-
-	// new_price_a = new_price_b
-	// price_a * (1 - illiq_a * x * price_a) = price_b * (1 + illiq_b * x * price_a * (1 - illiq_a * x * price_a))
-	// (price_b * illiq_a * illiq_b * price_a^2)x^2 - (price_a^2*illiq_a + price_b * illiq_b * price_a) * x + (price_a - price_b) = 0
-
-	// PI_a = illiq_a * (amount1)
-	// amount1 = amount0 * price_a
-	// PI_a = illiq_a * amount0 * price_a
-
-	// new_price_a = price_a * (1 - illiq_a * amount0 * price_a)
-
-	// scenario B, SELL order in pool, arb1 pool a == BUY, arb2 pool b == SELL
-
-	// illiq = price impact / vol(amount)
-	// price impact = illiq * amount
-	// new price = price * (1 +/- price impact)
-
-	// input token0 (x)
-	// output token1 (y)
-
-	// BUY order in pool A:
-	// zeroForOne == false
-	// BUY pushes price up ->
-	// new_price_a = price_a * (1 + pi_a)
-	// pi_a = illiq_a * y
-	// new_price_a = price_a * (1 + illiq_a * y)
-	// x = y / new_price_a
-	// x = y / (price_a * (1 + illiq_a * y))
-
-	// SELL order in Pool B:
-	// zerForOne == true
-	// SELL pushes price down ->
-	// new_price_b = price_b * (1 - pi_b)
-	// pi_b = illiq_b * x * price_b
-	// pi_b = illiq_b * price_b * (y / (price_a * (1 + illiq_a * y)))
-	// new_price_b = price_b * (1 - (illiq_b * price_b * (y / (price_a * (1 + illiq_a * y)))))
-	// new_price_b = price_b - price_b^2 * illiq_b * y / (price_a * (1 + illiq_a * y))
-
-	// price_a * (1 + illiq_a * y) = price_b - price_b^2 * illiq_b * y / (price_a * (1 + illiq_a * y))
-	// price_a + price_a * illiq_a * y = price_b - price_b^2 * illiq_b * y / (price_a * (1 + illiq_a * y))
-	// price_a + price_a * illiq_a * y = price_b - price_b^2 * illiq_b * y / (price_a + price_a * illiq_a * y)
-	// (price_a + price_a * illiq_a * y)^2 = price_b * (price_a + price_a * illiq_a * y) - price_b^2 * illiq_b * y
-	// price_a^2 + 2 * price_a^2 * illiq_a * y + price_a^2 * illiq_a^2 * y^2 = price_a * price_b + price_a * price_b * illiq_a * y - price_b^2 * illiq_b * y
-	// price_a^2 * illiq_a^2 * y^2 + (2 * price_a^2 * illiq_a - price_a * price_b * illiq_a + price_b^2 * illiq_b) * y + (price_a^2 - price_a * price_b) = 0
-	
-	// This is a quadratic equation in terms of y:
-	// A * y^2 + B * y + C = 0
-	// where:
-	// A = price_a^2 * illiq_a^2
-	// B = 2 * price_a^2 * illiq_a - price_a * price_b * illiq_a + price_b^2 * illiq_b
-	// C = price_a^2 - price_a * price_b
-	
-	// Using quadratic formula: y = (-B ± sqrt(B^2 - 4*A*C)) / (2*A)
-	// We take the positive root since y represents a positive amount
-
-	// FINAL FORMULAS
-		// zerForOne == true
-		// (P_B * ILLIQ_A * ILLIQ_B * P_A²)x² - (P_A² * ILLIQ_A + P_B * ILLIQ_B * P_A) * x + (P_A - P_B) = 0
-		// (price_b * illiq_a * illiq_b * price_a^2)x^2 - (price_a^2 * illiq_a + price_b * illiq_b * price_a)x + (price_a - price_b) = 0
-        
