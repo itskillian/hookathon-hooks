@@ -90,6 +90,15 @@ Swap logic flow
 <!-- 2. current implementation is not direction sensitive, but we could add direction sensitivity wished. For example apply inventory exposure protection only if price moves against us --> 
 3. is it alright to return calculatePin = 0 when volume is 0, I think this should never happen
 4. is it alright to return calculateInventoryExposure = 0
+5. if our first quote is in the same direction as the original swap
+	this means we will receive the wrong token after swapping
+	original token0 -> token1 (zeroForOne = true) sell eth for usdc, push price down
+	our pool is still to high
+	arb 1: token0 -> token1, push price down more
+	arb 2: token1 -> token0, push other pool price up to meet our pool
+	we are left with excess token0, which the original swapper will receive
+	original swapper wants the other token, so we need to swap it back
+	what about in this scenario we set the second quote to an exact output swap?
 
 ### Arb Proof
 make formula to solve for amount0 (assume all metrics are in quote asset - token1)
@@ -142,8 +151,8 @@ make formula to solve for amount0 (assume all metrics are in quote asset - token
 	price impact = illiq * amount
 	new price = price * (1 +/- price impact)
 
-	input token0 (x)
-	output token1 (y)
+	input token1 (x)
+	output token0 (y)
 
 	BUY order in pool A:
 	zeroForOne == false
@@ -188,3 +197,75 @@ make formula to solve for amount0 (assume all metrics are in quote asset - token
 ### Office hours questions
 
 - pool inventory tracking: does add liquidity always add 0 or more tokens, is there a scenario where a user can add token0 and sub token1 (edge of range or redistribute range) or would it just be >= 0. Or call the afterAdd with token0 then afterRemove token1
+
+### Final Arb Proof
+- case 1: zeroForOne == true, input token0:
+	new_price_a = price_a * (1 - pi_a)
+    pi_a = illiq_a * token0_in_token1
+	pi_a = illiq_a * token0 * price_a
+
+	new_price_a = price_a * (1 - illiq_a * token0 * price_a)
+
+	new_price_b = price_b * (1 + pi_b)
+	pi_b = illiq_b * token1
+	token1 = token0 * new_price_a
+	token1 = token0 * price_a * (1 - illiq_a * token0 * price_a)
+	pi_b = illiq_b * token0 * price_a * (1 - illiq_a * token0 * price_a)
+
+	new_price_b = price_b * (1 + illiq_b * token0 * price_a * (1 - illiq_a * token0 * price_a))
+
+	new_price_a = new_price_b
+
+	1500 1625 > real price
+	2000 1875 < price
+	optimal 1750
+
+
+	price_b * (1 + illiq_b * token0 * price_a * (1 - illiq_a * token0 * price_a)) = price_a * (1 - illiq_a * token0 * price_a)
+	price_b * (1 + illiq_b * token0 * price_a - illiq_b * token0^2 * price_a^2 * illiq_a) = price_a - illiq_a * token0 * price_a^2
+	price_b + price_b * illiq_b * token0 * price_a - price_b * illiq_b * illiq_a * token0^2 * price_a^2 = price_a - illiq_a * token0 * price_a^2
+	-(price_b * illiq_b * illiq_a * price_a^2) * token0^2 + (price_b * illiq_b * price_a + price_a^2 * illiq_a) * token0 - (price_b - price_a) = 0
+
+	where x is token0 input
+	ax^2 + bx + c = 0
+	a = price_a^2 * price_b * illiq_a * illiq_b
+	b = -(price_a * price_b * illiq_b + price_a^2 * illiq_a)
+	c = price_a - price_b
+
+	token0 = (-b + sqrt(b^2 - 4*a*c)) / (2*a)
+
+- case 2: zeroForOne == false, input token1:
+	new_price_a = price_a * (1 + pi_a)
+	pi_a = illiq_a * token1
+	
+	new_price_a = price_a * (1 + illiq_a * token1)
+
+	new_price_b = price_b * (1 - pi_b)
+	pi_b = illiq_b * token0 * price_b
+	token0 = token1 / new_price_a
+	token0 = token1 / (price_a * (1 + illiq_a * token1))
+	pi_b = illiq_b * price_b * (token1 / (price_a * (1 + illiq_a * token1)))
+	
+	new_price_b = price_b * (1 - (illiq_b * price_b * (token1 / (price_a * (1 + illiq_a * token1)))))
+	new_price_b = price_b - price_b^2 * illiq_b * token1 / (price_a * (1 + illiq_a * token1))
+
+	price_a * (1 + illiq_a * token1) = price_b - price_b^2 * illiq_b * token1 / (price_a * (1 + illiq_a * token1))
+	(price_a * (1 + illiq_a * token1))^2 = price_b * (price_a * (1 + illiq_a * token1) - price_b^2 * illiq_b * token1
+	(price_a + price_a * illiq_a * token1)^2 = price_b * (price_a + price_a * illiq_a * token1) - price_b^2 * illiq_b * token1
+	price_a^2 + 2price_a^2 * illiq_a * token1 + price_a^2 * illiq_a^2 * token1^2 = price_b * price_a + price_b * price_a * illiq_a * token1 - price_b^2 * illiq_b * token1
+	(price_a^2 * illiq_a^2)token1^2 + (2price_a^2 * illiq_a + price_b^2 * illiq_b - price_b * price_a * illiq_a)token1 + (price_a^2 - price_a * price_b)
+
+
+	price_a + price_a * illiq_a * token1 = price_b - price_b^2 * illiq_b * token1 / (price_a * (1 + illiq_a * token1))
+	price_a + price_a * illiq_a * token1 = price_b - price_b^2 * illiq_b * token1 / (price_a + price_a * illiq_a * token1)
+	(price_a + price_a * illiq_a * token1)^2 = price_b * (price_a + price_a * illiq_a * token1) - price_b^2 * illiq_b * token1
+	price_a^2 + 2 * price_a^2 * illiq_a * token1 + price_a^2 * illiq_a^2 * token1^2 = price_a * price_b + price_a * price_b * illiq_a * token1 - price_b^2 * illiq_b * token1
+	price_a^2 * illiq_a^2 * token1^2 + (2 * price_a^2 * illiq_a - price_a * price_b * illiq_a + price_b^2 * illiq_b) * token1 + (price_a^2 - price_a * price_b) = 0
+	
+	where y is token1 input
+	ay^2 + by + c = 0
+	a = price_a^2 * illiq_a^2
+	b = 2 * price_a^2 * illiq_a + price_b^2 * illiq_b - price_a * price_b * illiq_a
+	c = price_a^2 - price_a * price_b
+
+	token1 = (-b + sqrt(b^2 - 4*a*c)) / (2*a)
