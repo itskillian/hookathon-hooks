@@ -3,8 +3,8 @@ pragma solidity ^0.8.0;
 
 import {ParseBytes} from "@uniswap/v4-core/src/libraries/ParseBytes.sol";
 
-library QuoterRevertWithPrice {
-    using QuoterRevertWithPrice for bytes;
+library QuoterRevertPrice {
+    using QuoterRevertPrice for bytes;
     using ParseBytes for bytes;
 
     error UnexpectedRevertBytes(bytes revertData);
@@ -19,10 +19,8 @@ library QuoterRevertWithPrice {
             revert(add(revertData, 0x20), mload(revertData))
         }
     }
-
-    function parseQuoteWithPrice(bytes memory reason) internal pure returns (uint256 amountOut, uint160 sqrtPriceX96) {
-        // If the error doesnt start with QuoteSwapWithPrice, we know this isnt a valid quote to parse
-        // Instead it is another revert that was triggered somewhere in the simulation
+    
+    function parseQuoteAmountAndPrice(bytes memory reason) internal pure returns (uint256 amountOut, uint160 sqrtPriceX96) {
         if (reason.parseSelector() != QuoteSwapWithPrice.selector) {
             revert UnexpectedRevertBytes(reason);
         }
