@@ -34,7 +34,7 @@ contract ArbPinHook is BaseHook {
 
     uint256 private constant PRECISION = 1e18;
     uint256 private constant PIPS_SCALE = 1e6;
-    uint256 private constant ILLIQ_SCALE = 1e6;
+    uint256 private constant ILLIQ_SCALE = 1e18;
     uint256 private constant FEE_DIVISOR = 1e38;
     uint256 private constant ARB_QUOTE_COUNT = 3;
 
@@ -89,7 +89,6 @@ contract ArbPinHook is BaseHook {
     }
 
     // state variables
-    IV4Quoter public immutable quoter;
     address public owner;
     bool private _executingArb;
     uint160 private _tempSqrtPriceX96;
@@ -99,9 +98,8 @@ contract ArbPinHook is BaseHook {
     mapping(PoolId => address) public poolCreator; // main poolId -> pool creator
 
     // constructor
-    constructor(IPoolManager _poolManager, IV4Quoter _quoter) BaseHook(_poolManager) {
+    constructor(IPoolManager _poolManager) BaseHook(_poolManager) {
         owner = msg.sender;
-        quoter = _quoter;
     }
 
     /*
@@ -185,7 +183,7 @@ contract ArbPinHook is BaseHook {
             );
         }
         
-        uint256 nextSwapVolToken1 = getNextSwapVolumeToken1(params, data.sqrtPriceX96Before, data.deltaDecimals);
+        uint256 nextSwapVolToken1 = estimateNextSwapVolume(params, data.sqrtPriceX96Before, data.deltaDecimals);
 
         int256 pin = calculatePIN(data.totalVolume, data.netVolume, params.zeroForOne, nextSwapVolToken1);
 
@@ -225,6 +223,7 @@ contract ArbPinHook is BaseHook {
 
         // calc price impact and illiq of last swap
         uint256 lastSwapPriceImpact = calculatePriceImpact(data.sqrtPriceX96Before, data.sqrtPriceX96After);
+
         uint256 lastSwapIlliq = calculateIlliq(lastSwapPriceImpact, lastSwapAmount1);
 
         // update illiq average and swap count
@@ -232,14 +231,15 @@ contract ArbPinHook is BaseHook {
         data.swapCount += 1;
 
         // ------ ARB LOGIC ------
-        if (msg.sender == address(quoter)) {
-            return (BaseHook.afterSwap.selector, 0);
-        }
+        // if (msg.sender == address(quoter)) { // fix this because we dont use the quoter anymore
+        //     return (BaseHook.afterSwap.selector, 0);
+        // }
 
         {
             (uint160 sqrtPriceX96Arb, , , ) = poolManager.getSlot0(arbPoolKey[poolId].toId());
 
             if (!_executingArb) {
+                console.log("beginning arb logic");
                 _executingArb = true;
                 uint256 netArbProfit;
                 
@@ -259,11 +259,7 @@ contract ArbPinHook is BaseHook {
                 uint160 finalPriceMidpoint = (arbQuoteResult.finalSqrtPriceX96 + arbQuoteResult.finalSqrtPriceX96Arb) / 2;
 
                 // caveman check to see if we improved the pool state (not for production)
-                if (!improved || netArbProfit <= 0) {
-                    console.log("netArbProfit", netArbProfit);
-                    console.log("Pool state not improved");
-                    console.log("priceDeltaChangePips (NEGATIVE)", priceDeltaChangePips);
-                    
+                if (!improved || netArbProfit <= 0) {                    
                     return (BaseHook.afterSwap.selector, 0);
                 } else if (netArbProfit > 0) {
                     (uint256 profitToken0, uint256 profitToken1) = executeArb(key, arbPoolKey[poolId], arbQuoteResult.inputAmount, arbQuoteResult.arbZeroForOne, finalPriceMidpoint);
@@ -311,14 +307,12 @@ contract ArbPinHook is BaseHook {
     }
 
     /*
-    ------ HELPER FUNCTIONS ------ 
+    ---------- HELPER FUNCTIONS ----------
     */
     
     /**
-     * @dev Calculate price impact, illiq, and average illiq of the last swap
-     * @param priceImpactPips price impact of the last swap scaled by PIPS_SCALE (1e6)
-     * @param volume volume of the last swap in token1 terms
-     * @return illiquidity 
+     * @dev all variables are in token1 terms to stay consistent with price
+     * illiq is scaled by (1e6)
      */
     function calculateIlliq(
         uint256 priceImpactPips,
@@ -327,22 +321,27 @@ contract ArbPinHook is BaseHook {
         return (priceImpactPips * ILLIQ_SCALE) / volume;
     }
 
+    /**
+     * @dev all variables are in token1 terms to stay consistent with price
+     * illiq is scaled by (1e6)
+     */
     function calculateAvgIlliq(
         uint256 lastIlliq,
         uint256 avgIlliq,
         uint256 swapCount
-    ) internal pure returns (uint256 newAvgIlliq) {
+    ) internal pure returns (uint256) {
         return (avgIlliq * swapCount + lastIlliq) / (swapCount + 1);
     }
     
+    /*
+    ---------- PIN FUNCTIONS ----------
+    */
+
     /**
-     * @dev Get or estimate the next swap volume of token1
-     * @param params swap params sent by user
-     * @param sqrtPriceX96Before price before swap
-     * @param deltaDecimals difference in decimals between token0 and token1
-     * @return next swap volume of token1
+     * @notice simple estimate of the next swap volume in token1 terms
+     * @dev used in _beforeSwap to calculate PIN
      */
-    function getNextSwapVolumeToken1(
+    function estimateNextSwapVolume(
         SwapParams calldata params,
         uint160 sqrtPriceX96Before,
         int8 deltaDecimals
@@ -588,10 +587,6 @@ contract ArbPinHook is BaseHook {
 
    /**
      * @dev Configures the pool's quote asset and arb pool
-     * @param poolId main pool id
-     * @param useToken1AsQuote Whether to use token1 as the quote asset
-     * @param key main pool key
-     * @param arbKey arb pool key
      */
     function configurePool(
         PoolId poolId, 
@@ -655,7 +650,7 @@ contract ArbPinHook is BaseHook {
             {
                 // estimate input amount for hook pool arb swap
                 uint256 arbInputAmount = estimateArbInput(sqrtPriceX96, sqrtPriceX96Arb, tempIlliq, tempIlliqArb, bestArbQuoteResult.arbZeroForOne);
-                
+
                 IV4Quoter.QuoteExactSingleParams memory quoteParams = IV4Quoter.QuoteExactSingleParams({
                     poolKey: key,
                     zeroForOne: bestArbQuoteResult.arbZeroForOne,
@@ -721,11 +716,21 @@ contract ArbPinHook is BaseHook {
         uint256 lastIlliqArb,
         bool arbZeroForOne
     ) internal pure returns (uint256 arbInputAmount) {
+        if (sqrtPriceX96 == 0 || sqrtPriceX96Arb == 0) {
+            return 0;
+        } else if (lastIlliq > 0 && lastIlliqArb == 0) {
+            lastIlliqArb = lastIlliq;
+        } else if (lastIlliq == 0) {
+            console.log("lastIlliq is 0, returning 0");
+            return 0;
+        }
+
         // convert all to int256
         int256 sqrtPriceX96Int = int256(uint256(sqrtPriceX96));
         int256 sqrtPriceX96ArbInt = int256(uint256(sqrtPriceX96Arb));
         int256 lastIlliqInt = int256(lastIlliq);
         int256 lastIlliqArbInt = int256(lastIlliqArb);
+
 
         int256 a;
         int256 b;
@@ -747,7 +752,7 @@ contract ArbPinHook is BaseHook {
 
     function quoteExactInputSingleReturnPrice(IV4Quoter.QuoteExactSingleParams memory quoteParams) external setMsgSender returns (Quote memory quote) {
         uint256 gasBefore = gasleft();
-        try poolManager.unlock(abi.encodeCall(this._quoteExactInputSingleReturnPrice, (quoteParams))) {}
+        try this._quoteExactInputSingleReturnPrice(quoteParams) {}
         catch (bytes memory reason) {
             quote.gasEstimate = gasBefore - gasleft();
             // Extract the quote from QuoteSwap error, or throw if the quote failed
