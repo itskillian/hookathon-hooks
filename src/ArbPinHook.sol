@@ -22,7 +22,9 @@ import {ModifyLiquidityParams} from "v4-core/types/PoolOperation.sol";
 import {IV4Quoter} from "v4-periphery/src/interfaces/IV4Quoter.sol";
 import {Math} from "openzeppelin-contracts/contracts/utils/math/Math.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
-import {QuoterRevertPrice} from "lp-hub/libraries/QuoterRevertPrice.sol";
+import {QuoterRevertPrice} from "./QuoterRevertPrice.sol";
+import {Locker} from "v4-periphery/src/libraries/Locker.sol";
+import {IERC20Minimal} from "v4-core/interfaces/external/IERC20Minimal.sol";
 
 contract ArbPinHook is BaseHook {
     using LPFeeLibrary for uint24;
@@ -43,6 +45,7 @@ contract ArbPinHook is BaseHook {
     error InvalidTimeDecay();
     error InvalidFee();
     error NegativeArbProfit(uint256 inputAmount, uint256 outputAmount);
+    error NotSelf();
 
     struct Inventory {
         uint256 token0;
@@ -71,8 +74,17 @@ contract ArbPinHook is BaseHook {
     }
 
     struct Quote {
-        uint160 sqrtPriceX96;
         uint256 amountOut;
+        uint256 gasEstimate;
+        uint160 finalSqrtPriceX96;
+    }
+
+    struct ArbQuoteResult {
+        uint256 inputAmount;
+        bool arbZeroForOne;
+        uint256 grossProfit;
+        uint160 finalSqrtPriceX96;
+        uint160 finalSqrtPriceX96Arb;
         uint256 gasEstimate;
     }
 
@@ -110,6 +122,11 @@ contract ArbPinHook is BaseHook {
         Locker.set(msg.sender);
         _; // execute the function
         Locker.set(address(0)); // reset the locker
+    }
+
+    modifier selfOnly() {
+        if (msg.sender != address(this)) revert NotSelf();
+        _;
     }
 
     /*
@@ -172,7 +189,7 @@ contract ArbPinHook is BaseHook {
 
         int256 pin = calculatePIN(data.totalVolume, data.netVolume, params.zeroForOne, nextSwapVolToken1);
 
-        uint256 expectedPriceImpact = estimatePriceImpactBeforeSwap(data, nextSwapVolToken1);
+        uint256 expectedPriceImpact = estimatePriceImpactBeforeSwap(data.lastIlliq, nextSwapVolToken1);
 
         uint256 relevantInventoryExposure = calculateInventoryExposure(data, params.zeroForOne);
 
@@ -219,38 +236,41 @@ contract ArbPinHook is BaseHook {
             return (BaseHook.afterSwap.selector, 0);
         }
 
-        (uint160 sqrtPriceX96Arb, , , ) = poolManager.getSlot0(arbPoolKey[poolId].toId());
+        {
+            (uint160 sqrtPriceX96Arb, , , ) = poolManager.getSlot0(arbPoolKey[poolId].toId());
 
-        if (!_executingArb) {
-            _executingArb = true;
-            
-            // calc arb opportunity
-            (uint256 inputAmount, bool arbZeroForOne, uint256 grossProfit, uint160 finalSqrtPriceX96, uint160 finalSqrtPriceX96Arb) = calculateArbInput(data.sqrtPriceX96After, sqrtPriceX96Arb, lastSwapIlliq, data.lastIlliqArb);
-            
-            // calc arb profit
-            if (grossProfit > 0) {
-                // we have an arb
-                uint256 netArbProfit = calculateArbNetProfit(grossProfit, inputAmount, arbZeroForOne);
-            }
-            
-            // calc
-            (uint256 priceDeltaChangePips, bool improved) = calculatePoolPriceDelta(data.sqrtPriceX96After, finalSqrtPriceX96, sqrtPriceX96Arb, finalSqrtPriceX96Arb);
-
-            // caveman calc final price midpoint (not for production) to use for swap limit
-            uint256 finalPriceMidpoint = (finalSqrtPriceX96 + finalSqrtPriceX96Arb) / 2;
-
-            // caveman check to see if we improved the pool state (not for production)
-            if (!improved || netArbProfit <= 0) {
-                console.log("netArbProfit", netArbProfit);
-                console.log("Pool state not improved");
-                console.log("priceDeltaChangePips (NEGATIVE)", priceDeltaChangePips);
+            if (!_executingArb) {
+                _executingArb = true;
+                uint256 netArbProfit;
                 
-                return (BaseHook.afterSwap.selector, 0);
-            } else if (netArbProfit > 0) {
-                uint256 actualArbProfit = executeArb(key, arbPoolKey[poolId], inputAmount, arbZeroForOne, data.useToken1AsQuote, finalPriceMidpoint);
-            }
+                // calc arb opportunity
+                ArbQuoteResult memory arbQuoteResult = calculateArbInput(data.sqrtPriceX96After, sqrtPriceX96Arb, lastSwapIlliq, data.lastIlliqArb, key);
+                
+                // calc arb profit
+                if (arbQuoteResult.grossProfit > 0) {
+                    // we have an arb
+                    netArbProfit = calculateArbNetProfit(arbQuoteResult.grossProfit, arbQuoteResult.gasEstimate, arbQuoteResult.finalSqrtPriceX96, arbQuoteResult.arbZeroForOne, data.deltaDecimals);
+                }
+                
+                // calc
+                (uint256 priceDeltaChangePips, bool improved) = calculatePoolPriceDelta(data.sqrtPriceX96After, arbQuoteResult.finalSqrtPriceX96, sqrtPriceX96Arb, arbQuoteResult.finalSqrtPriceX96Arb);
 
-            _executingArb = false; // Reset flag after arb
+                // caveman calc final price midpoint (not for production) to use for swap limit
+                uint160 finalPriceMidpoint = (arbQuoteResult.finalSqrtPriceX96 + arbQuoteResult.finalSqrtPriceX96Arb) / 2;
+
+                // caveman check to see if we improved the pool state (not for production)
+                if (!improved || netArbProfit <= 0) {
+                    console.log("netArbProfit", netArbProfit);
+                    console.log("Pool state not improved");
+                    console.log("priceDeltaChangePips (NEGATIVE)", priceDeltaChangePips);
+                    
+                    return (BaseHook.afterSwap.selector, 0);
+                } else if (netArbProfit > 0) {
+                    (uint256 profitToken0, uint256 profitToken1) = executeArb(key, arbPoolKey[poolId], arbQuoteResult.inputAmount, arbQuoteResult.arbZeroForOne, finalPriceMidpoint);
+                }
+
+                _executingArb = false; // Reset flag after arb
+            }
         }
 
         return (BaseHook.afterSwap.selector, 0);
@@ -348,6 +368,7 @@ contract ArbPinHook is BaseHook {
         }
     }
 
+    // TODO
     function calculatePIN(
         uint256 totalVolume,
         int256 netVolume,
@@ -374,20 +395,20 @@ contract ArbPinHook is BaseHook {
 
     /**
      * @dev Estimate the expected price impact of the next swap before swap
-     * @param data pool data storage pointer
+     * @param lastIlliq last swap illiq
      * @param nextSwapVolToken1 next swap volume in token1 terms
      * @return expectedPriceImpact expected price impact of the next swap scaled by PIPS_SCALE (1e6)
      */
     function estimatePriceImpactBeforeSwap(
-        PoolData storage data,
+        uint256 lastIlliq,
         uint256 nextSwapVolToken1
-    ) internal view returns (uint256 expectedPriceImpact) {
-        // TODO is this min fee alright?
-        if (data.avgIlliq == 0 || nextSwapVolToken1 == 0) {
-            return data.minFee;
+    ) internal pure returns (uint256 expectedPriceImpact) {
+        // check for previous swap data
+        if (lastIlliq == 0 || nextSwapVolToken1 == 0) {
+            return 0;
         }
-        
-        expectedPriceImpact = (data.avgIlliq * nextSwapVolToken1) / (1e6 * PRECISION);
+
+        expectedPriceImpact = (lastIlliq * nextSwapVolToken1) / (1e6 * PRECISION);
     }
 
     /**
@@ -617,54 +638,73 @@ contract ArbPinHook is BaseHook {
     
     /// @notice determines direction, arb input amount and opportunity of arbitrage
     /// uses illiq to calculate input amount needed to bring both pools to equal price or as close as possible
-    function calculateArbInput(uint160 sqrtPriceX96, uint160 sqrtPriceX96Arb, uint256 tempIlliq, uint256 tempIlliqArb) internal returns (uint256, bool, uint256, uint160, uint160) {
+    function calculateArbInput(uint160 sqrtPriceX96, uint160 sqrtPriceX96Arb, uint256 tempIlliq, uint256 tempIlliqArb, PoolKey calldata key) internal returns (ArbQuoteResult memory bestArbQuoteResult) {
+        PoolId poolId = key.toId();
+        
         // direction of 1st arb swap in our pool
-        bool arbZeroForOne = data.sqrtPriceX96After > sqrtPriceX96Arb;
-        uint256 arbInputAmount;
-        uint256 bestInputAmount;
-        uint256 bestGrossProfit;
+        bestArbQuoteResult.arbZeroForOne = sqrtPriceX96 > sqrtPriceX96Arb;
 
         // loop ARB_QUOTE_COUNT times
         for (uint256 i = 0; i < ARB_QUOTE_COUNT; i++) {
-            // estimate input amount for hook pool arb swap
-            arbInputAmount = estimateArbInput(sqrtPriceX96, sqrtPriceX96Arb, tempIlliq, tempIlliqArb, arbZeroForOne);
-            
-            IV4Quoter.QuoteExactSingleParams memory quoteParams = IV4Quoter.QuoteExactSingleParams({
-                poolKey: key,
-                zeroForOne: arbZeroForOne,
-                exactAmount: uint128(arbInputAmount),
-                hookData: ""
-            });
-            // quote hook pool
-            (uint256 amountOut, uint256 gasEstimate, uint160 finalSqrtPriceX96) = quoter.quoteExactInputSingleReturnPrice(quoteParams);
+            {
+                // estimate input amount for hook pool arb swap
+                uint256 arbInputAmount = estimateArbInput(sqrtPriceX96, sqrtPriceX96Arb, tempIlliq, tempIlliqArb, bestArbQuoteResult.arbZeroForOne);
+                
+                IV4Quoter.QuoteExactSingleParams memory quoteParams = IV4Quoter.QuoteExactSingleParams({
+                    poolKey: key,
+                    zeroForOne: bestArbQuoteResult.arbZeroForOne,
+                    exactAmount: uint128(arbInputAmount),
+                    hookData: ""
+                });
+                // quote hook pool
+                Quote memory quoteA = this.quoteExactInputSingleReturnPrice(quoteParams);
 
-            IV4Quoter.QuoteExactSingleParams memory arbQuoteParams = IV4Quoter.QuoteExactSingleParams({
-                poolKey: arbPoolKey[poolId],
-                zeroForOne: !arbZeroForOne,
-                exactAmount: uint128(amountOut),
-                hookData: ""
-            });
-            // quote arb pool
-            (uint256 arbAmountOut, uint256 arbGasEstimate, uint160 finalSqrtPriceX96Arb) = quoter.quoteExactInputSingleReturnPrice(arbQuoteParams);
+                IV4Quoter.QuoteExactSingleParams memory arbQuoteParams = IV4Quoter.QuoteExactSingleParams({
+                    poolKey: arbPoolKey[poolId],
+                    zeroForOne: !bestArbQuoteResult.arbZeroForOne,
+                    exactAmount: uint128(quoteA.amountOut),
+                    hookData: ""
+                });
+                // quote arb pool
+                Quote memory quoteB = this.quoteExactInputSingleReturnPrice(arbQuoteParams);
 
-            // check profitability
-            if (arbAmountOut > arbInputAmount) {
-                // we have an arb
-                uint256 tempGrossProfit = arbAmountOut - arbInputAmount;
-                if (tempGrossProfit > bestGrossProfit) {
-                    bestGrossProfit = tempGrossProfit;
-                    bestInputAmount = arbInputAmount;
+                // check profitability
+                if (quoteB.amountOut > arbInputAmount) {
+                    // we have an arb
+                    uint256 tempGrossProfit = quoteB.amountOut - arbInputAmount;
+                    if (tempGrossProfit > bestArbQuoteResult.grossProfit) {
+                        bestArbQuoteResult.grossProfit = tempGrossProfit;
+                        bestArbQuoteResult.inputAmount = arbInputAmount;
+                        bestArbQuoteResult.finalSqrtPriceX96 = quoteA.finalSqrtPriceX96;
+                        bestArbQuoteResult.finalSqrtPriceX96Arb = quoteB.finalSqrtPriceX96;
+                        bestArbQuoteResult.gasEstimate = quoteA.gasEstimate + quoteB.gasEstimate;
+                    }
                 }
+
+                // note 5
+
+                // update illiq values using token1 values
+                tempIlliq = calculateIlliq(
+                    calculatePriceImpact(sqrtPriceX96, quoteA.finalSqrtPriceX96),
+                    bestArbQuoteResult.arbZeroForOne ? quoteA.amountOut : arbInputAmount
+                );
+
+                tempIlliqArb = calculateIlliq(
+                    calculatePriceImpact(sqrtPriceX96Arb, quoteB.finalSqrtPriceX96),
+                    bestArbQuoteResult.arbZeroForOne ? quoteB.amountOut : quoteA.amountOut
+                );
+                // go loop again
             }
-
-            // note 5
-
-            // update illiq values
-            tempIlliq = calculateIlliq(calculatePriceImpact(data.sqrtPriceX96After, finalSqrtPriceX96), arbInputAmount);
-            tempIlliqArb = calculateIlliq(calculatePriceImpact(sqrtPriceX96Arb, finalSqrtPriceX96Arb), arbAmountOut);
-            // go loop again
         }
-        return (bestInputAmount, arbZeroForOne, bestGrossProfit, finalSqrtPriceX96, finalSqrtPriceX96Arb);
+
+        return ArbQuoteResult({
+            inputAmount: bestArbQuoteResult.inputAmount,
+            arbZeroForOne: bestArbQuoteResult.arbZeroForOne,
+            grossProfit: bestArbQuoteResult.grossProfit,
+            finalSqrtPriceX96: bestArbQuoteResult.finalSqrtPriceX96,
+            finalSqrtPriceX96Arb: bestArbQuoteResult.finalSqrtPriceX96Arb,
+            gasEstimate: bestArbQuoteResult.gasEstimate
+        });
     }
 
     /**
@@ -682,42 +722,50 @@ contract ArbPinHook is BaseHook {
         uint256 lastIlliqArb,
         bool arbZeroForOne
     ) internal pure returns (uint256 arbInputAmount) {
-        uint256 a;
-        uint256 b;
-        uint256 c;
+        // convert all to int256
+        int256 sqrtPriceX96Int = int256(uint256(sqrtPriceX96));
+        int256 sqrtPriceX96ArbInt = int256(uint256(sqrtPriceX96Arb));
+        int256 lastIlliqInt = int256(lastIlliq);
+        int256 lastIlliqArbInt = int256(lastIlliqArb);
+
+        int256 a;
+        int256 b;
+        int256 c;
+
+        // fix this, overflow hell
         if (arbZeroForOne) { // 'selling' token0 pushes price down in pool a
-            a = sqrtPriceX96 * sqrtPriceX96 * sqrtPriceX96Arb * lastIlliq * lastIlliqArb;
-            b = -(sqrtPriceX96 * sqrtPriceX96Arb * lastIlliqArb + sqrtPriceX96 * sqrtPriceX96 * lastIlliq);
-            c = sqrtPriceX96 - sqrtPriceX96Arb;
+            a = sqrtPriceX96Int * sqrtPriceX96Int * sqrtPriceX96ArbInt * lastIlliqInt * lastIlliqArbInt;
+            b = -(sqrtPriceX96Int * sqrtPriceX96ArbInt * lastIlliqArbInt + sqrtPriceX96Int * sqrtPriceX96Int * lastIlliqInt);
+            c = sqrtPriceX96Int - sqrtPriceX96ArbInt;
         } else {
-            a = sqrtPriceX96 * sqrtPriceX96 * lastIlliq * lastIlliq;
-            b = 2 * sqrtPriceX96 * sqrtPriceX96 * lastIlliq + sqrtPriceX96Arb * sqrtPriceX96Arb * lastIlliqArb - sqrtPriceX96 * sqrtPriceX96Arb * lastIlliq;
-            c = sqrtPriceX96 * sqrtPriceX96 - sqrtPriceX96 * sqrtPriceX96Arb;
+            a = sqrtPriceX96Int * sqrtPriceX96Int * lastIlliqInt * lastIlliqInt;
+            b = 2 * sqrtPriceX96Int * sqrtPriceX96Int * lastIlliqInt + sqrtPriceX96ArbInt * sqrtPriceX96ArbInt * lastIlliqArbInt - sqrtPriceX96Int * sqrtPriceX96ArbInt * lastIlliqInt;
+            c = sqrtPriceX96Int * sqrtPriceX96Int - sqrtPriceX96Int * sqrtPriceX96ArbInt;
         }
 
-        arbInputAmount = (-b + Math.sqrt(b*b - 4*a*c)) / (2*a);
+        arbInputAmount = uint256((-b + int256(Math.sqrt(uint256(b*b - 4*a*c)))) / (2*a));
     }
 
-    function quoteExactInputSingleReturnPrice(QuoteExactSingleParams memory quoteParams)
+    function quoteExactInputSingleReturnPrice(IV4Quoter.QuoteExactSingleParams memory quoteParams)
         external
         setMsgSender
-        returns (uint256 amountOut, uint256 gasEstimate, uint160 sqrtPriceX96)
+        returns (Quote memory quote)
     {
         uint256 gasBefore = gasleft();
         try poolManager.unlock(abi.encodeCall(this._quoteExactInputSingleReturnPrice, (quoteParams))) {}
         catch (bytes memory reason) {
-            gasEstimate = gasBefore - gasleft();
+            quote.gasEstimate = gasBefore - gasleft();
             // Extract the quote from QuoteSwap error, or throw if the quote failed
-            (amountOut, sqrtPriceX96) = reason.parseQuoteAmountAndPrice();
+            (quote.amountOut, quote.finalSqrtPriceX96) = reason.parseQuoteAmountAndPrice();
         }
     }
     
-    function _quoteExactInputSingleReturnPrice(QuoteExactSingleParams calldata quoteParams) external selfOnly returns (bytes memory) {
+    function _quoteExactInputSingleReturnPrice(IV4Quoter.QuoteExactSingleParams calldata quoteParams) external selfOnly returns (bytes memory) {
         BalanceDelta swapDelta = poolManager.swap(
             quoteParams.poolKey,
             SwapParams({
                 zeroForOne: quoteParams.zeroForOne,
-                amountSpecified: quoteParams.exactAmount,
+                amountSpecified: int256(uint256(quoteParams.exactAmount)),
                 sqrtPriceLimitX96: quoteParams.zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
             }),
             quoteParams.hookData
@@ -738,9 +786,9 @@ contract ArbPinHook is BaseHook {
         QuoterRevertPrice.revertQuoteWithPrice(amountOut, finalSqrtPriceX96);
     }
 
-    function calculateArbNetProfit(uint256 grossProfit, uint256 gasEstimate, uint256 arbGasEstimate, uint160 finalSqrtPriceX96, bool arbZeroForOne, int8 deltaDecimals) internal returns (uint256) {
+    function calculateArbNetProfit(uint256 grossProfit, uint256 totalGasEstimate, uint160 finalSqrtPriceX96, bool arbZeroForOne, int8 deltaDecimals) internal view returns (uint256) {
         // gas calcs
-        uint256 gasCostEth = (gasEstimate + arbGasEstimate) * tx.gasprice / 1e18;
+        uint256 gasCostEth = (totalGasEstimate) * tx.gasprice / 1e18;
 
         uint256 gasCostToken1 = convertToken0ToToken1(gasCostEth, finalSqrtPriceX96, deltaDecimals);
 
@@ -757,7 +805,7 @@ contract ArbPinHook is BaseHook {
         uint160 finalSqrtPriceX96,
         uint160 sqrtPriceX96Arb,
         uint160 finalSqrtPriceX96Arb
-    ) internal returns (uint256, bool) {
+    ) internal pure returns (uint256, bool) {
         // before arb delta
         uint256 originalDelta = (sqrtPriceX96 > sqrtPriceX96Arb) ?
             sqrtPriceX96 - sqrtPriceX96Arb :
@@ -781,11 +829,11 @@ contract ArbPinHook is BaseHook {
 
     function executeArb(
         PoolKey calldata key,
-        PoolKey calldata arbKey,
+        PoolKey storage arbKey,
         uint256 inputAmount,
         bool arbZeroForOne,
         uint160 finalPriceMidpoint
-    ) internal returns (uint256) {
+    ) internal returns (uint256, uint256) {
         // set swap params A (exact input)
         SwapParams memory swapAParams = SwapParams({
             zeroForOne: arbZeroForOne,
@@ -814,17 +862,40 @@ contract ArbPinHook is BaseHook {
         
         // swap B
         BalanceDelta swapDeltaB = poolManager.swap(arbKey, swapBParams, "");
-
-        // Calculate final profit
-        uint256 finalOutputAmount = arbZeroForOne ?
-            uint256(abs(swapDeltaB.amount0())) :
-            uint256(abs(swapDeltaB.amount1()));
+        
+        int256 netDelta0 = swapDeltaA.amount0() + swapDeltaB.amount0();
+        int256 netDelta1 = swapDeltaA.amount1() + swapDeltaB.amount1();
+        uint256 profitToken0;
+        uint256 profitToken1;
+        
+        if (netDelta0 < 0) {
+            _settle(key.currency0, uint256(-netDelta0));
+        } else if (netDelta0 > 0) {
+            profitToken0 = uint256(netDelta0);
+            poolManager.take(key.currency0, address(this), uint256(profitToken0));
+        }
+        if (netDelta1 < 0) {
+            _settle(key.currency1, uint256(-netDelta1));
+        } else if (netDelta1 > 0) {
+            profitToken1 = uint256(netDelta1);
+            poolManager.take(key.currency1, address(this), uint256(profitToken1));
+        }
 
         // Profit = what we got back - what we put in
-        if (finalOutputAmount >= inputAmount) {
-            return finalOutputAmount - inputAmount;
+        if (profitToken0 > 0 || profitToken1 > 0) {
+            return (profitToken0, profitToken1);
         } else {
-            revert NegativeArbProfit(inputAmount, finalOutputAmount);
+            return (0, 0);
+        }
+    }
+
+    function _settle(Currency currency, uint256 amount) internal {
+        if (currency.isAddressZero()) {
+            poolManager.settle{value: amount}();
+        } else {
+            poolManager.sync(currency);
+            IERC20Minimal(Currency.unwrap(currency)).transferFrom(address(this), address(poolManager), amount);
+            poolManager.settle();
         }
     }
 }
