@@ -244,7 +244,7 @@ contract ArbPinHook is BaseHook {
                 uint256 netArbProfit;
                 
                 // calc arb opportunity
-                ArbQuoteResult memory arbQuoteResult = calculateArbInput(data.sqrtPriceX96After, sqrtPriceX96Arb, lastSwapIlliq, data.lastIlliqArb, key);
+                ArbQuoteResult memory arbQuoteResult = detectArb(data.sqrtPriceX96After, sqrtPriceX96Arb, lastSwapIlliq, data.lastIlliqArb, key);
                 
                 // calc arb profit
                 if (arbQuoteResult.grossProfit > 0) {
@@ -633,12 +633,18 @@ contract ArbPinHook is BaseHook {
     }
 
     /*
-    ------ ARB HELPER FUNCTIONS ------
+        ---------- ARB HELPER FUNCTIONS ----------
     */
-    
+
     /// @notice determines direction, arb input amount and opportunity of arbitrage
     /// uses illiq to calculate input amount needed to bring both pools to equal price or as close as possible
-    function calculateArbInput(uint160 sqrtPriceX96, uint160 sqrtPriceX96Arb, uint256 tempIlliq, uint256 tempIlliqArb, PoolKey calldata key) internal returns (ArbQuoteResult memory bestArbQuoteResult) {
+    function detectArb(
+        uint160 sqrtPriceX96,
+        uint160 sqrtPriceX96Arb,
+        uint256 tempIlliq,
+        uint256 tempIlliqArb,
+        PoolKey calldata key
+    ) internal returns (ArbQuoteResult memory bestArbQuoteResult) {
         PoolId poolId = key.toId();
         
         // direction of 1st arb swap in our pool
@@ -707,14 +713,7 @@ contract ArbPinHook is BaseHook {
         });
     }
 
-    /**
-     * @dev Estimate the input amount for the first arb swap in the hook pool, so that the hook pool and arb pool prices are equal
-     * @param sqrtPriceX96 current price of the pool
-     * @param sqrtPriceX96Arb current price of the arb pool
-     * @param lastIlliq last illiq of the pool
-     * @param lastIlliqArb last illiq of the arb pool
-     * @return arbInputAmount input amount for the first arb swap in the hook pool
-     */
+    /// @dev Estimate the input amount for the first arb swap in the hook pool, so that the hook pool and arb pool prices are equal
     function estimateArbInput(
         uint160 sqrtPriceX96,
         uint160 sqrtPriceX96Arb,
@@ -746,11 +745,7 @@ contract ArbPinHook is BaseHook {
         arbInputAmount = uint256((-b + int256(Math.sqrt(uint256(b*b - 4*a*c)))) / (2*a));
     }
 
-    function quoteExactInputSingleReturnPrice(IV4Quoter.QuoteExactSingleParams memory quoteParams)
-        external
-        setMsgSender
-        returns (Quote memory quote)
-    {
+    function quoteExactInputSingleReturnPrice(IV4Quoter.QuoteExactSingleParams memory quoteParams) external setMsgSender returns (Quote memory quote) {
         uint256 gasBefore = gasleft();
         try poolManager.unlock(abi.encodeCall(this._quoteExactInputSingleReturnPrice, (quoteParams))) {}
         catch (bytes memory reason) {
